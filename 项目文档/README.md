@@ -4,7 +4,7 @@ HeadscaleEnrollmentGate is an original operator-side admission layer for issuing
 
 The gate uses an unmodified Headscale CLI and a local Headscale control socket. Headscale itself remains authoritative for node registration and the key's single-use and expiration checks. A user-owned key has no tags. A tagged key can record an issuing user, but Headscale registers the node under its `tagged-devices` identity; that issuing user is **not** the node owner.
 
-This is an engineering candidate. A controlled local lab showed three synthetic nodes registering under two synthetic users or one tag and checked denial cases. It does not identify a Headscale vulnerability, prove device identity, or establish eligibility for any external program. See [the validation record](VALIDATION.md) for the exact local evidence and how to reproduce it.
+A controlled local lab showed three synthetic nodes registering under two synthetic users or one tag and checked denial cases. This work does not identify a Headscale vulnerability, prove device identity, or establish eligibility for any external program. See [the validation record](VALIDATION.md) for the exact local evidence and how to reproduce it.
 
 ## Layout
 
