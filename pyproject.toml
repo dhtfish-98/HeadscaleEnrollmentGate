@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "headscale-enrollment-gate"
+version = "0.1.0"
+description = "Durable operator-side admission for Headscale pre-auth key issuance"
+readme = "项目文档/README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["项目文档/LICENSE", "项目文档/第三方许可/*LICENSE"]
+authors = [{name = "dhtfish98"}]
+dependencies = []
+
+[project.scripts]
+headscale-enrollment-gate = "headscale_enrollment_gate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
