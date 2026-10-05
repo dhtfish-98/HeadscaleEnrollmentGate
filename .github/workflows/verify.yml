@@ -70,6 +70,9 @@ jobs:
           ref: eeaac680bef26585c8cc1569f949e26d0d6aba80
           path: Build/ci/upstream
           persist-credentials: false
+      - name: Prepare Build directories before Go setup
+        shell: bash
+        run: mkdir -p "$HSEG_BUILD" "$GOMODCACHE" "$GOCACHE" "$GOTMPDIR" "$TMPDIR" "$PYTHONPYCACHEPREFIX"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.14'
