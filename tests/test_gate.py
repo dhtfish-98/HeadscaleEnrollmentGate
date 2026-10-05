@@ -6,7 +6,9 @@ import threading
 import time
 import unittest
 
-from headscale_enrollment_gate.gate import EnrollmentGate, GateError, MintedKey
+from headscale_enrollment_gate.gate import (
+    EnrollmentGate, GateError, HeadscaleCLI, MintedKey,
+)
 
 
 class FakeIssuer:
@@ -15,8 +17,10 @@ class FakeIssuer:
         self.calls = []
         self.expired = []
         self.fail = False
+        self.expire_fail = False
         self.delay = 0
         self.wrong_tags = False
+        self.bad_secret = False
 
     def mint(self, user_id, tags, ttl_seconds):
         self.calls.append((user_id, tags, ttl_seconds))
@@ -25,13 +29,40 @@ class FakeIssuer:
         if self.fail:
             raise RuntimeError("unavailable")
         return MintedKey(
-            secret="hskey-auth-SYNTHETIC", key_id=str(len(self.calls)),
+            secret="BAD" if self.bad_secret else "hskey-auth-SYNTHETIC",
+            key_id=str(len(self.calls)),
             user_id=user_id, tags=("tag:wrong",) if self.wrong_tags else tags,
             expires_at=self.clock() + ttl_seconds, reusable=False, used=False,
         )
 
     def expire(self, key_id):
         self.expired.append(key_id)
+        if self.expire_fail:
+            raise RuntimeError("synthetic revocation failure")
+
+
+class BlockingIssuer(FakeIssuer):
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.minted = threading.Event()
+        self.release_mint = threading.Event()
+        self.expiring = threading.Event()
+        self.release_expire = threading.Event()
+        self.block_expire = False
+
+    def mint(self, user_id, tags, ttl_seconds):
+        key = super().mint(user_id, tags, ttl_seconds)
+        self.minted.set()
+        if not self.release_mint.wait(5):
+            raise RuntimeError("mint synchronization timed out")
+        return key
+
+    def expire(self, key_id):
+        if self.block_expire:
+            self.expiring.set()
+            if not self.release_expire.wait(5):
+                raise RuntimeError("expire synchronization timed out")
+        super().expire(key_id)
 
 
 class GateTests(unittest.TestCase):
@@ -123,7 +154,135 @@ class GateTests(unittest.TestCase):
         with self.assertRaises(GateError):
             self.gate.redeem(token, "alice-ops", "tagged", "1", ["tag:lab-a"])
         self.assertEqual(self.issuer.expired, ["1"])
-        self.assertEqual(self.gate.status(grant_id)["status"], "failed")
+        self.assertEqual(self.gate.status(grant_id)["status"], "revoked")
+
+    def test_invalid_key_secret_is_revoked_and_not_returned(self):
+        grant_id, token, _ = self.gate.plan("alice-ops", "personal", "1", [], 300)
+        self.issuer.bad_secret = True
+        with self.assertRaises(GateError):
+            self.gate.redeem(token, "alice-ops", "personal", "1", [])
+        self.assertEqual(self.issuer.expired, ["1"])
+        self.assertEqual(self.gate.status(grant_id)["status"], "revoked")
+
+    def test_policy_revoke_during_mint_never_discloses_key(self):
+        self.issuer = BlockingIssuer(self.clock)
+        self.gate = EnrollmentGate(self.db, self.policy, self.issuer, self.clock)
+        grant_id, token, _ = self.gate.plan("alice-ops", "personal", "1", [], 300)
+        outcome = {}
+
+        def redeem():
+            try:
+                outcome["key"] = self.gate.redeem(
+                    token, "alice-ops", "personal", "1", []
+                )
+            except GateError as exc:
+                outcome["error"] = str(exc)
+
+        worker = threading.Thread(target=redeem)
+        worker.start()
+        self.assertTrue(self.issuer.minted.wait(5))
+        self.policy.write_text('{"version":1,"audiences":{}}')
+        self.issuer.release_mint.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("key", outcome)
+        self.assertIn("revoked", outcome["error"])
+        self.assertEqual(self.issuer.expired, ["1"])
+        self.assertEqual(self.gate.status(grant_id)["status"], "revoked")
+        self.assertEqual(self.gate.status(grant_id)["key_id"], "1")
+
+    def test_revocation_failure_is_durable_and_not_disclosed(self):
+        self.issuer = BlockingIssuer(self.clock)
+        self.issuer.expire_fail = True
+        self.gate = EnrollmentGate(self.db, self.policy, self.issuer, self.clock)
+        grant_id, token, _ = self.gate.plan("alice-ops", "personal", "1", [], 300)
+        outcome = {}
+
+        def redeem():
+            try:
+                outcome["key"] = self.gate.redeem(
+                    token, "alice-ops", "personal", "1", []
+                )
+            except GateError as exc:
+                outcome["error"] = str(exc)
+
+        worker = threading.Thread(target=redeem)
+        worker.start()
+        self.assertTrue(self.issuer.minted.wait(5))
+        self.policy.write_text('{"version":1,"audiences":{}}')
+        self.issuer.release_mint.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("key", outcome)
+        self.assertIn("operator review", outcome["error"])
+        self.assertEqual(self.issuer.expired, ["1"])
+        reopened = EnrollmentGate(self.db, self.policy, self.issuer, self.clock)
+        self.assertEqual(reopened.status(grant_id)["status"], "revocation_open")
+        self.assertEqual(reopened.status(grant_id)["key_id"], "1")
+        with self.assertRaises(GateError):
+            reopened.redeem(token, "alice-ops", "personal", "1", [])
+
+    def test_revocation_intent_is_durable_before_external_expire(self):
+        self.issuer = BlockingIssuer(self.clock)
+        self.issuer.block_expire = True
+        self.gate = EnrollmentGate(self.db, self.policy, self.issuer, self.clock)
+        grant_id, token, _ = self.gate.plan("alice-ops", "personal", "1", [], 300)
+        outcome = {}
+
+        def redeem():
+            try:
+                outcome["key"] = self.gate.redeem(
+                    token, "alice-ops", "personal", "1", []
+                )
+            except GateError as exc:
+                outcome["error"] = str(exc)
+
+        worker = threading.Thread(target=redeem)
+        worker.start()
+        self.assertTrue(self.issuer.minted.wait(5))
+        self.policy.write_text('{"version":1,"audiences":{}}')
+        self.issuer.release_mint.set()
+        self.assertTrue(self.issuer.expiring.wait(5))
+        reopened = EnrollmentGate(self.db, self.policy, self.issuer, self.clock)
+        self.assertEqual(reopened.status(grant_id)["status"], "revocation_open")
+        self.assertEqual(reopened.status(grant_id)["key_id"], "1")
+        self.issuer.release_expire.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("key", outcome)
+        self.assertEqual(reopened.status(grant_id)["status"], "revoked")
+
+    def test_malformed_cli_response_and_failed_revoke_need_review(self):
+        class MalformedHeadscale(HeadscaleCLI):
+            def _run(self, args):
+                if args[1] == "create":
+                    return {"id": "42"}
+                raise GateError("synthetic expire failure")
+
+        gate = EnrollmentGate(
+            self.db, self.policy,
+            MalformedHeadscale(Path("/unused"), Path("/unused")), self.clock,
+        )
+        grant_id, token, _ = gate.plan("alice-ops", "personal", "1", [], 300)
+        with self.assertRaisesRegex(GateError, "operator review"):
+            gate.redeem(token, "alice-ops", "personal", "1", [])
+        self.assertEqual(gate.status(grant_id)["status"], "revocation_open")
+        self.assertEqual(gate.status(grant_id)["key_id"], "42")
+
+    def test_uncertain_cli_create_without_key_id_needs_review(self):
+        class UncertainHeadscale(HeadscaleCLI):
+            def _run(self, args):
+                raise GateError("synthetic lost create response")
+
+        gate = EnrollmentGate(
+            self.db, self.policy,
+            UncertainHeadscale(Path("/unused"), Path("/unused")), self.clock,
+        )
+        grant_id, token, _ = gate.plan("alice-ops", "personal", "1", [], 300)
+        with self.assertRaisesRegex(GateError, "operator review"):
+            gate.redeem(token, "alice-ops", "personal", "1", [])
+        self.assertEqual(gate.status(grant_id)["status"], "revocation_open")
+        self.assertIsNone(gate.status(grant_id)["key_id"])
 
     def test_concurrent_redeem_has_one_winner(self):
         _, token, _ = self.gate.plan("alice-ops", "personal", "1", [], 300)

@@ -30,6 +30,14 @@ class GateError(Exception):
     """A closed admission decision safe to show to the caller."""
 
 
+class KeyRevocationOpen(GateError):
+    """A create request may have minted a key that could not be revoked."""
+
+    def __init__(self, key_id: str | None):
+        super().__init__("Headscale key issuance needs operator review")
+        self.key_id = key_id
+
+
 def canonical_tags(tags: list[str] | tuple[str, ...]) -> tuple[str, ...]:
     if len(tags) != len(set(tags)) or any(not TAG.fullmatch(tag) for tag in tags):
         raise GateError("invalid or repeated tag")
@@ -87,7 +95,12 @@ class HeadscaleCLI:
         ]
         for tag in tags:
             args.extend(("--tags", tag))
-        value = self._run(args)
+        try:
+            value = self._run(args)
+        except GateError as exc:
+            # A failed/invalid CLI response does not prove that create was
+            # rolled back on the service. There may be no known key ID.
+            raise KeyRevocationOpen(None) from exc
         key_id = value.get("id")
         try:
             expiry = datetime.fromisoformat(value["expiration"].replace("Z", "+00:00"))
@@ -116,8 +129,10 @@ class HeadscaleCLI:
             if isinstance(key_id, str) and USER_ID.fullmatch(key_id):
                 try:
                     self.expire(key_id)
-                except GateError:
-                    pass
+                except GateError as revoke_error:
+                    raise KeyRevocationOpen(key_id) from revoke_error
+            else:
+                raise KeyRevocationOpen(None) from exc
             raise GateError("Headscale key metadata was invalid") from exc
 
     def expire(self, key_id: str) -> None:
@@ -237,6 +252,57 @@ class EnrollmentGate:
             )
             db.commit()
 
+    def _record_revocation_open(self, grant_id: str, key_id: str | None) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                "UPDATE grants SET status='revocation_open', key_id=?, issued_at=? "
+                "WHERE id=? AND status='issuing'",
+                (key_id, self.clock(), grant_id),
+            )
+            if changed.rowcount != 1:
+                raise GateError("grant state changed during issuance")
+            db.commit()
+
+    def _revoke_minted(
+        self, grant_id: str, minted: MintedKey, reason: GateError,
+        recorded: bool = False,
+    ) -> None:
+        if not recorded:
+            try:
+                self._record_revocation_open(grant_id, minted.key_id)
+                recorded = True
+            except Exception:
+                # Still try to expire the key. Never disclose its secret when
+                # the durable status could not be written.
+                pass
+        try:
+            self.issuer.expire(minted.key_id)
+        except Exception as exc:
+            raise GateError(
+                "key was not disclosed; Headscale revocation needs operator review"
+            ) from exc
+        if not recorded:
+            raise GateError(
+                "key was revoked, but the grant record needs operator review"
+            ) from reason
+        try:
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                changed = db.execute(
+                    "UPDATE grants SET status='revoked' "
+                    "WHERE id=? AND status='revocation_open' AND key_id=?",
+                    (grant_id, minted.key_id),
+                )
+                if changed.rowcount != 1:
+                    raise GateError("grant state changed during revocation")
+                db.commit()
+        except Exception as exc:
+            raise GateError(
+                "key was revoked, but the grant record needs operator review"
+            ) from exc
+        raise reason
+
     def redeem(
         self, token: str, audience: str, mode: str, user_id: str, tags: list[str]
     ) -> MintedKey:
@@ -266,34 +332,70 @@ class EnrollmentGate:
         if remaining < 1:
             self._set_failed(grant_id)
             raise GateError("grant expired during issuance")
-        minted = None
         try:
             minted = self.issuer.mint(user_id, scoped_tags, remaining)
-            if (minted.user_id != user_id or minted.tags != scoped_tags or
-                    minted.reusable is not False or minted.used is not False or
-                    minted.expires_at > deadline or self.clock() >= deadline):
-                raise GateError("issued key was outside the approved scope")
-            with self._connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                changed = db.execute(
-                    "UPDATE grants SET status='issued', key_id=?, issued_at=? "
-                    "WHERE id=? AND status='issuing'",
-                    (minted.key_id, self.clock(), grant_id),
-                )
-                if changed.rowcount != 1:
-                    raise GateError("grant state changed during issuance")
-                db.commit()
-            return minted
+        except KeyRevocationOpen as exc:
+            try:
+                self._record_revocation_open(grant_id, exc.key_id)
+            except Exception:
+                pass
+            raise GateError(
+                "key was not disclosed; Headscale issuance needs operator review"
+            ) from exc
         except Exception as exc:
-            if minted is not None:
-                try:
-                    self.issuer.expire(minted.key_id)
-                except Exception:
-                    pass
             self._set_failed(grant_id)
             if isinstance(exc, GateError):
                 raise
             raise GateError("key issuance failed") from exc
+
+        if (not isinstance(minted, MintedKey) or
+                not isinstance(minted.key_id, str) or
+                not USER_ID.fullmatch(minted.key_id)):
+            try:
+                self._record_revocation_open(grant_id, None)
+            except Exception:
+                pass
+            raise GateError(
+                "key was not disclosed; unknown key ID needs operator review"
+            )
+
+        try:
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                now = self._observe_clock(db)
+                status = db.execute(
+                    "SELECT status FROM grants WHERE id=?", (grant_id,)
+                ).fetchone()
+                approved = (
+                    status == ("issuing",) and now < deadline and
+                    isinstance(minted.secret, str) and
+                    minted.secret.startswith("hskey-auth-") and
+                    minted.user_id == user_id and minted.tags == scoped_tags and
+                    minted.reusable is False and minted.used is False and
+                    math.isfinite(minted.expires_at) and
+                    now < minted.expires_at <= deadline and
+                    self._allowed(audience, mode, user_id, scoped_tags)
+                )
+                changed = db.execute(
+                    "UPDATE grants SET status=?, key_id=?, issued_at=? "
+                    "WHERE id=? AND status='issuing'",
+                    ("issued" if approved else "revocation_open",
+                     minted.key_id, now, grant_id),
+                )
+                if changed.rowcount != 1:
+                    raise GateError("grant state changed during issuance")
+                db.commit()
+        except Exception as exc:
+            self._revoke_minted(
+                grant_id, minted, GateError("grant state could not be confirmed")
+            )
+        if not approved:
+            self._revoke_minted(
+                grant_id, minted,
+                GateError("grant was revoked, expired or outside approved scope"),
+                recorded=True,
+            )
+        return minted
 
     def status(self, grant_id: str) -> dict:
         with self._connect() as db:

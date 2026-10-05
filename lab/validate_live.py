@@ -16,6 +16,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from urllib.request import urlopen
 
@@ -200,14 +201,83 @@ def main() -> int:
         if alice == bob:
             raise AssertionError("users collided")
         policy = run_dir / "gate-policy.json"
-        policy.write_text(json.dumps({"version": 1, "audiences": {
+        initial_policy = {"version": 1, "audiences": {
             "alice-ops": {"personal_users": [alice],
                           "tagged": {alice: ["tag:lab-a"]}},
             "bob-ops": {"personal_users": [bob],
                         "tagged": {bob: ["tag:lab-b"]}},
-        }}, sort_keys=True))
+        }}
+        policy.write_text(json.dumps(initial_policy, sort_keys=True))
         db_path = run_dir / "gate.sqlite"
         gate = EnrollmentGate(db_path, policy, HeadscaleCLI(args.headscale, config))
+
+        class PausedIssuer:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.minted = threading.Event()
+                self.release = threading.Event()
+                self.key = None
+
+            def mint(self, user_id, tags, ttl_seconds):
+                self.key = self.delegate.mint(user_id, tags, ttl_seconds)
+                self.minted.set()
+                if not self.release.wait(20):
+                    raise GateError("live issuance synchronization timed out")
+                return self.key
+
+            def expire(self, key_id):
+                self.delegate.expire(key_id)
+
+        paused = PausedIssuer(HeadscaleCLI(args.headscale, config))
+        race_gate = EnrollmentGate(db_path, policy, paused)
+        race_id, race_token, _ = race_gate.plan(
+            "alice-ops", "personal", alice, [], 300
+        )
+        race_outcome = {}
+
+        def redeem_during_policy_change():
+            try:
+                race_outcome["key"] = race_gate.redeem(
+                    race_token, "alice-ops", "personal", alice, []
+                )
+            except GateError as exc:
+                race_outcome["error"] = str(exc)
+
+        race_thread = threading.Thread(target=redeem_during_policy_change)
+        race_thread.start()
+        try:
+            if not paused.minted.wait(30):
+                raise AssertionError("live key mint did not reach the pause")
+            revoked_policy = json.loads(json.dumps(initial_policy))
+            revoked_policy["audiences"]["alice-ops"]["personal_users"] = []
+            replacement = run_dir / "gate-policy-revoked.json"
+            replacement.write_text(json.dumps(revoked_policy, sort_keys=True))
+            replacement.replace(policy)
+        finally:
+            paused.release.set()
+            race_thread.join(30)
+        if race_thread.is_alive() or "key" in race_outcome:
+            raise AssertionError("revoked live grant disclosed a key")
+        if not race_outcome.get("error") or paused.key is None:
+            raise AssertionError("live race did not complete with a closed decision")
+        if race_gate.status(race_id)["status"] != "revoked":
+            raise AssertionError("live race did not record the key as revoked")
+        if race_gate.status(race_id)["key_id"] != paused.key.key_id:
+            raise AssertionError("live race lost the minted key ID")
+        listed = [key for key in keys() if key["id"] == paused.key.key_id]
+        if len(listed) != 1:
+            raise AssertionError("live race key was not found in Headscale")
+        before = len(nodes())
+        if probe(paused.key.secret, "lab-revoked", timeout=8) or len(nodes()) != before:
+            raise AssertionError("revoked live key registered a node")
+        result["events"].append({
+            "case": "policy_revoke_during_real_key_mint", "pass": True,
+            "grant_status": "revoked", "key_id": paused.key.key_id,
+            "node_count_unchanged": True,
+        })
+        replacement = run_dir / "gate-policy-restored.json"
+        replacement.write_text(json.dumps(initial_policy, sort_keys=True))
+        replacement.replace(policy)
 
         alice_grant, token, _ = gate.plan("alice-ops", "personal", alice, [], 300)
         alice_key = gate.redeem(token, "alice-ops", "personal", alice, [])
