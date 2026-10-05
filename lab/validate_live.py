@@ -279,6 +279,54 @@ def main() -> int:
         replacement.write_text(json.dumps(initial_policy, sort_keys=True))
         replacement.replace(policy)
 
+        for case, mode, tags in (
+            ("personal_string", "personal", []),
+            ("personal_false_mapping", "personal", []),
+            ("tagged_false_mapping", "tagged", ["tag:lab-a"]),
+            ("boolean_version", "personal", []),
+        ):
+            schema_grant, schema_token, _ = gate.plan(
+                "alice-ops", mode, alice, tags, 300
+            )
+            malformed_policy = json.loads(json.dumps(initial_policy))
+            if case == "personal_string":
+                malformed_policy["audiences"]["alice-ops"]["personal_users"] = alice
+            elif case == "personal_false_mapping":
+                malformed_policy["audiences"]["alice-ops"]["personal_users"] = {
+                    alice: False
+                }
+            elif case == "tagged_false_mapping":
+                malformed_policy["audiences"]["alice-ops"]["tagged"] = {
+                    alice: {"tag:lab-a": False}
+                }
+            else:
+                malformed_policy["version"] = True
+            replacement = run_dir / f"gate-policy-invalid-{case}.json"
+            replacement.write_text(json.dumps(malformed_policy, sort_keys=True))
+            replacement.replace(policy)
+            before = len(keys())
+            try:
+                gate.plan("alice-ops", mode, alice, tags, 300)
+            except GateError:
+                pass
+            else:
+                raise AssertionError(f"malformed policy {case} allowed a plan")
+            try:
+                gate.redeem(schema_token, "alice-ops", mode, alice, tags)
+            except GateError:
+                pass
+            else:
+                raise AssertionError(f"malformed policy {case} disclosed a key")
+            if len(keys()) != before or gate.status(schema_grant)["status"] != "pending":
+                raise AssertionError(f"malformed policy {case} changed key state")
+            result["events"].append({
+                "case": f"schema_{case}_rejected", "pass": True,
+                "key_count_unchanged": True, "grant_status": "pending",
+            })
+            replacement = run_dir / f"gate-policy-restored-{case}.json"
+            replacement.write_text(json.dumps(initial_policy, sort_keys=True))
+            replacement.replace(policy)
+
         alice_grant, token, _ = gate.plan("alice-ops", "personal", alice, [], 300)
         alice_key = gate.redeem(token, "alice-ops", "personal", alice, [])
         if not probe(alice_key.secret, "lab-alice"):

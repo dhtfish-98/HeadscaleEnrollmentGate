@@ -24,6 +24,7 @@ from typing import Callable, Protocol
 
 TAG = re.compile(r"tag:[A-Za-z0-9][A-Za-z0-9_-]{0,62}\Z")
 USER_ID = re.compile(r"[1-9][0-9]*\Z")
+AUDIENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 
 
 class GateError(Exception):
@@ -39,9 +40,48 @@ class KeyRevocationOpen(GateError):
 
 
 def canonical_tags(tags: list[str] | tuple[str, ...]) -> tuple[str, ...]:
-    if len(tags) != len(set(tags)) or any(not TAG.fullmatch(tag) for tag in tags):
+    if (type(tags) not in (list, tuple) or
+            any(type(tag) is not str or not TAG.fullmatch(tag) for tag in tags) or
+            len(tags) != len(set(tags))):
         raise GateError("invalid or repeated tag")
     return tuple(sorted(tags))
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("repeated policy key")
+        result[key] = value
+    return result
+
+
+def _valid_policy(policy: object) -> bool:
+    if (type(policy) is not dict or set(policy) != {"version", "audiences"} or
+            type(policy["version"]) is not int or policy["version"] != 1 or
+            type(policy["audiences"]) is not dict):
+        return False
+    for audience, role in policy["audiences"].items():
+        if (type(audience) is not str or not AUDIENCE.fullmatch(audience) or
+                type(role) is not dict or
+                set(role) != {"personal_users", "tagged"}):
+            return False
+        users = role["personal_users"]
+        tagged = role["tagged"]
+        if (type(users) is not list or
+                any(type(user) is not str or not USER_ID.fullmatch(user)
+                    for user in users) or
+                len(users) != len(set(users)) or
+                type(tagged) is not dict):
+            return False
+        for user, tags in tagged.items():
+            if (type(user) is not str or not USER_ID.fullmatch(user) or
+                    type(tags) is not list or
+                    any(type(tag) is not str or not TAG.fullmatch(tag)
+                        for tag in tags) or
+                    len(tags) != len(set(tags))):
+                return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -196,8 +236,10 @@ class EnrollmentGate:
         self, audience: str, mode: str, user_id: str, tags: tuple[str, ...]
     ) -> bool:
         try:
-            policy = json.loads(self.policy_path.read_text())
-            if policy["version"] != 1 or not isinstance(policy["audiences"], dict):
+            policy = json.loads(
+                self.policy_path.read_text(), object_pairs_hook=_unique_object
+            )
+            if not _valid_policy(policy):
                 return False
             role = policy["audiences"][audience]
             if mode == "personal":
@@ -226,7 +268,10 @@ class EnrollmentGate:
         tags: list[str], ttl_seconds: int,
     ) -> tuple[str, str, float]:
         scoped_tags = canonical_tags(tags)
-        if not USER_ID.fullmatch(user_id) or not 5 <= ttl_seconds <= 3600:
+        if (type(audience) is not str or not AUDIENCE.fullmatch(audience) or
+                type(mode) is not str or mode not in ("personal", "tagged") or
+                type(user_id) is not str or not USER_ID.fullmatch(user_id) or
+                type(ttl_seconds) is not int or not 5 <= ttl_seconds <= 3600):
             raise GateError("invalid user or lifetime")
         if not self._allowed(audience, mode, user_id, scoped_tags):
             raise GateError("scope is not allowed")
@@ -307,7 +352,10 @@ class EnrollmentGate:
         self, token: str, audience: str, mode: str, user_id: str, tags: list[str]
     ) -> MintedKey:
         scoped_tags = canonical_tags(tags)
-        if not USER_ID.fullmatch(user_id) or len(token) > 256:
+        if (type(token) is not str or not 1 <= len(token) <= 256 or
+                type(audience) is not str or not AUDIENCE.fullmatch(audience) or
+                type(mode) is not str or mode not in ("personal", "tagged") or
+                type(user_id) is not str or not USER_ID.fullmatch(user_id)):
             raise GateError("invalid redemption")
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         with self._connect() as db:

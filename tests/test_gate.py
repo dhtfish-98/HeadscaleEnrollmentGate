@@ -137,6 +137,142 @@ class GateTests(unittest.TestCase):
             self.gate.redeem(token, "alice-ops", "personal", "1", [])
         self.assertEqual(self.issuer.calls, [])
 
+    def _assert_malformed_policy_blocks_plan_and_redeem(self, bad_policy, mode):
+        valid = {"version": 1, "audiences": {
+            "ops": {"personal_users": ["2"],
+                    "tagged": {"2": ["tag:lab-a"]}},
+        }}
+        self.policy.write_text(json.dumps(valid))
+        tags = ["tag:lab-a"] if mode == "tagged" else []
+        grant_id, token, _ = self.gate.plan("ops", mode, "2", tags, 300)
+        self.policy.write_text(
+            bad_policy if isinstance(bad_policy, str) else json.dumps(bad_policy)
+        )
+        with self.assertRaises(GateError):
+            self.gate.plan("ops", mode, "2", tags, 300)
+        with self.assertRaises(GateError):
+            self.gate.redeem(token, "ops", mode, "2", tags)
+        self.assertEqual(self.gate.status(grant_id)["status"], "pending")
+        self.assertEqual(self.issuer.calls, [])
+
+    def test_schema_personal_string_does_not_authorize_member(self):
+        self._assert_malformed_policy_blocks_plan_and_redeem({
+            "version": 1, "audiences": {"ops": {
+                "personal_users": "123", "tagged": {},
+            }},
+        }, "personal")
+
+    def test_schema_personal_false_mapping_does_not_authorize_key(self):
+        self._assert_malformed_policy_blocks_plan_and_redeem({
+            "version": 1, "audiences": {"ops": {
+                "personal_users": {"2": False}, "tagged": {},
+            }},
+        }, "personal")
+
+    def test_schema_tagged_false_mapping_does_not_authorize_tag(self):
+        self._assert_malformed_policy_blocks_plan_and_redeem({
+            "version": 1, "audiences": {"ops": {
+                "personal_users": [], "tagged": {"2": {"tag:lab-a": False}},
+            }},
+        }, "tagged")
+
+    def test_schema_boolean_version_is_not_version_one(self):
+        self._assert_malformed_policy_blocks_plan_and_redeem({
+            "version": True, "audiences": {"ops": {
+                "personal_users": ["2"], "tagged": {},
+            }},
+        }, "personal")
+
+    def test_invalid_policy_shapes_and_duplicate_keys_fail_closed(self):
+        valid_role = {"personal_users": ["2"],
+                      "tagged": {"2": ["tag:lab-a"]}}
+        bad_cases = (
+            {"version": 1, "audiences": []},
+            {"version": 1, "audiences": {"ops": []}},
+            {"version": 1, "audiences": {"ops": {
+                "personal_users": [True], "tagged": {},
+            }}},
+            {"version": 1, "audiences": {"ops": {
+                "personal_users": ["2", "2"], "tagged": {},
+            }}},
+            {"version": 1, "audiences": {"ops": {
+                "personal_users": [], "tagged": {"0": ["tag:lab-a"]},
+            }}},
+            {"version": 1, "audiences": {"ops": {
+                "personal_users": [], "tagged": {"2": [False]},
+            }}},
+            {"version": 1, "audiences": {"ops": {
+                "personal_users": [], "tagged": {"2": ["tag:lab-a", "tag:lab-a"]},
+            }}},
+            {"version": 1, "audiences": {"ops": {
+                "personal_users": [], "tagged": {"2": ["lab-a"]},
+            }}},
+            {"version": 1, "audiences": {"ops": valid_role,
+                                        "other": {"personal_users": "2",
+                                                  "tagged": {}}}},
+            '{"version":1,"audiences":{"ops":{"personal_users":["2"],'
+            '"personal_users":["2"],"tagged":{"2":["tag:lab-a"]}}}}',
+        )
+        for bad in bad_cases:
+            with self.subTest(policy=bad):
+                self._assert_malformed_policy_blocks_plan_and_redeem(
+                    bad, "personal"
+                )
+
+    def test_invalid_api_argument_types_are_gate_errors(self):
+        self.policy.write_text(json.dumps({
+            "version": 1, "audiences": {"ops": {
+                "personal_users": ["2"], "tagged": {},
+            }},
+        }))
+        for audience, user, tags, ttl in (
+            ("ops", "2", [True], 300),
+            ("ops", 2, [], 300),
+            ("ops", "2", [], True),
+            ("ops", "2", [], 5.5),
+            (["ops"], "2", [], 300),
+        ):
+            with self.subTest(audience=audience, user=user, tags=tags, ttl=ttl):
+                with self.assertRaises(GateError):
+                    self.gate.plan(audience, "personal", user, tags, ttl)
+        _, token, _ = self.gate.plan("ops", "personal", "2", [], 300)
+        for args in ((None, "ops", "personal", "2", []),
+                     (token, "ops", "personal", 2, []),
+                     (token, "ops", "personal", "2", [False])):
+            with self.subTest(args=args):
+                with self.assertRaises(GateError):
+                    self.gate.redeem(*args)
+        self.assertEqual(self.issuer.calls, [])
+
+    def test_malformed_policy_during_mint_revokes_created_key(self):
+        self.issuer = BlockingIssuer(self.clock)
+        self.gate = EnrollmentGate(self.db, self.policy, self.issuer, self.clock)
+        grant_id, token, _ = self.gate.plan("alice-ops", "personal", "1", [], 300)
+        outcome = {}
+
+        def redeem():
+            try:
+                outcome["key"] = self.gate.redeem(
+                    token, "alice-ops", "personal", "1", []
+                )
+            except GateError as exc:
+                outcome["error"] = str(exc)
+
+        worker = threading.Thread(target=redeem)
+        worker.start()
+        self.assertTrue(self.issuer.minted.wait(5))
+        self.policy.write_text(json.dumps({
+            "version": 1, "audiences": {"alice-ops": {
+                "personal_users": "1", "tagged": {},
+            }},
+        }))
+        self.issuer.release_mint.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("key", outcome)
+        self.assertEqual(self.issuer.expired, ["1"])
+        self.assertEqual(self.gate.status(grant_id)["status"], "revoked")
+
     def test_failed_issuance_is_not_retried(self):
         grant_id, token, _ = self.gate.plan("alice-ops", "personal", "1", [], 300)
         self.issuer.fail = True
