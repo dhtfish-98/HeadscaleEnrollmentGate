@@ -1,0 +1,98 @@
+name: Verify Headscale enrollment gate
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  python-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    env:
+      HSEG_BUILD: ${{ github.workspace }}/Build/ci/python-${{ matrix.python }}
+      PIP_CACHE_DIR: ${{ github.workspace }}/Build/ci/cache/pip-${{ matrix.python }}
+      PYTHONPYCACHEPREFIX: ${{ github.workspace }}/Build/ci/cache/pycache-${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test source, wheel, and sdist
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HSEG_BUILD/source" "$HSEG_BUILD/tmp" "$PIP_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
+          export TMPDIR="$HSEG_BUILD/tmp"
+          git archive HEAD | tar -x -C "$HSEG_BUILD/source"
+          python -m pip install --disable-pip-version-check 'build==1.6.1'
+          (cd "$HSEG_BUILD/source" && PYTHONPATH=src python -m unittest discover -s tests -v)
+          python -m build --outdir "$HSEG_BUILD/dist" "$HSEG_BUILD/source"
+          python -m pip install --disable-pip-version-check --no-deps \
+            --target "$HSEG_BUILD/wheel-target" "$HSEG_BUILD"/dist/*.whl
+          (cd "$HSEG_BUILD/source" && PYTHONPATH="$HSEG_BUILD/wheel-target" python -m unittest discover -s tests -v)
+          python -m pip install --disable-pip-version-check --no-deps \
+            --target "$HSEG_BUILD/sdist-target" "$HSEG_BUILD"/dist/*.tar.gz
+          (cd "$HSEG_BUILD/source" && PYTHONPATH="$HSEG_BUILD/sdist-target" python -m unittest discover -s tests -v)
+          git rev-parse HEAD
+          sha256sum "$HSEG_BUILD"/dist/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: package-python-${{ matrix.python }}
+          path: ${{ env.HSEG_BUILD }}/dist/*
+          if-no-files-found: warn
+
+  headscale-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HSEG_BUILD: ${{ github.workspace }}/Build/ci/live-lab
+      GOMODCACHE: ${{ github.workspace }}/Build/ci/go-mod-cache
+      GOCACHE: ${{ github.workspace }}/Build/ci/go-build-cache
+      PYTHONPYCACHEPREFIX: ${{ github.workspace }}/Build/ci/pycache-live
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: juanfont/headscale
+          ref: eeaac680bef26585c8cc1569f949e26d0d6aba80
+          path: Build/ci/upstream
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.0'
+          cache: false
+      - name: Build pinned service and run synthetic registration lab
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Build/ci/bin "$HSEG_BUILD" "$GOMODCACHE" "$GOCACHE" "$PYTHONPYCACHEPREFIX"
+          test "$(git -C Build/ci/upstream rev-parse HEAD)" = eeaac680bef26585c8cc1569f949e26d0d6aba80
+          (cd Build/ci/upstream && go build -trimpath -o "$GITHUB_WORKSPACE/Build/ci/bin/headscale" ./cmd/headscale)
+          cp lab/tsnetprobe.go Build/ci/upstream/hseg_tsnetprobe.go
+          (cd Build/ci/upstream && go build -trimpath -o "$GITHUB_WORKSPACE/Build/ci/bin/tsnetprobe" ./hseg_tsnetprobe.go)
+          PYTHONPATH=src python lab/validate_live.py \
+            --upstream "$GITHUB_WORKSPACE/Build/ci/upstream" \
+            --headscale "$GITHUB_WORKSPACE/Build/ci/bin/headscale" \
+            --probe "$GITHUB_WORKSPACE/Build/ci/bin/tsnetprobe" \
+            --build-dir "$HSEG_BUILD"
+          git rev-parse HEAD
+          sha256sum Build/ci/bin/headscale Build/ci/bin/tsnetprobe "$HSEG_BUILD"/run-*/receipt.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: headscale-live-receipt
+          path: ${{ env.HSEG_BUILD }}/run-*/receipt.json
+          if-no-files-found: warn

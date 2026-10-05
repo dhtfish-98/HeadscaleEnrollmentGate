@@ -4,13 +4,14 @@ HeadscaleEnrollmentGate is an original operator-side admission layer for issuing
 
 The gate uses an unmodified Headscale CLI and a local Headscale control socket. Headscale itself remains authoritative for node registration and the key's single-use and expiration checks. A user-owned key has no tags. A tagged key can record an issuing user, but Headscale registers the node under its `tagged-devices` identity; that issuing user is **not** the node owner.
 
-This is a local engineering candidate. The controlled lab shows three synthetic nodes registering under two synthetic users or one tag and checks denial cases. It does not identify a Headscale vulnerability, prove device identity, or establish eligibility for any external program.
+This is an engineering candidate. A controlled local lab showed three synthetic nodes registering under two synthetic users or one tag and checked denial cases. It does not identify a Headscale vulnerability, prove device identity, or establish eligibility for any external program. See [the validation record](VALIDATION.md) for the exact local evidence and how to reproduce it.
 
 ## Layout
 
-- `项目源码/当前项目/research-cvp30-c-20261005/HeadscaleEnrollmentGate/`: original Python gate, unit tests and local Go client probe source.
-- `项目文档/当前项目/research-cvp30-c-20261005/HeadscaleEnrollmentGate/`: documentation, provenance and real third-party license texts.
-- `Build/验证/HeadscaleEnrollmentGate-20261006/`: pinned upstream reference, downloaded toolchain, binaries, caches, local service state during a run and redacted receipts.
+- [`src/headscale_enrollment_gate/`](../src/headscale_enrollment_gate/), [`tests/`](../tests/) and [`lab/`](../lab/): original gate, unit tests and local Go client probe source.
+- [`项目文档/`](./): documentation, provenance and third-party license texts.
+- [`.github/workflows/verify.yml`](../.github/workflows/verify.yml): source, package and pinned Headscale integration checks. Its generated artifacts live below `Build/ci` and can be downloaded from the corresponding workflow run after CI succeeds.
+- `Build/`: generated binaries, caches, local service state and redacted receipts. It is excluded from the source archive.
 
 No Headscale or Tailscale source files are copied into the gate package. The lab probe imports the pinned Tailscale `tsnet` module when compiled, and its binary stays in `Build`.
 

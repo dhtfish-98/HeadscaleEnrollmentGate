@@ -1,2 +1,3 @@
 recursive-include lab *.go *.py
+recursive-include .github *.yml
 recursive-include 项目文档 *.md *LICENSE LICENSE
