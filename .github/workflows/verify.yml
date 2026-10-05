@@ -56,6 +56,9 @@ jobs:
       HSEG_BUILD: ${{ github.workspace }}/Build/ci/live-lab
       GOMODCACHE: ${{ github.workspace }}/Build/ci/go-mod-cache
       GOCACHE: ${{ github.workspace }}/Build/ci/go-build-cache
+      GOTMPDIR: ${{ github.workspace }}/Build/ci/go-tmp
+      TMPDIR: ${{ github.workspace }}/Build/ci/tmp-live
+      GOTOOLCHAIN: local
       PYTHONPYCACHEPREFIX: ${{ github.workspace }}/Build/ci/pycache-live
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -78,7 +81,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p Build/ci/bin "$HSEG_BUILD" "$GOMODCACHE" "$GOCACHE" "$PYTHONPYCACHEPREFIX"
+          mkdir -p Build/ci/bin "$HSEG_BUILD" "$GOMODCACHE" "$GOCACHE" "$GOTMPDIR" "$TMPDIR" "$PYTHONPYCACHEPREFIX"
           test "$(git -C Build/ci/upstream rev-parse HEAD)" = eeaac680bef26585c8cc1569f949e26d0d6aba80
           (cd Build/ci/upstream && go build -trimpath -o "$GITHUB_WORKSPACE/Build/ci/bin/headscale" ./cmd/headscale)
           cp lab/tsnetprobe.go Build/ci/upstream/hseg_tsnetprobe.go
